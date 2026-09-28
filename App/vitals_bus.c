@@ -46,15 +46,20 @@
  *  the point of this project.
  ******************************************************************************
  */
-#include <stdio.h>
-#include "main.h"
 #include "vitals_bus.h"
 
-extern I2C_HandleTypeDef hi2c3;          /* CubeMX-generated (main.c)     */
+#include <stdio.h>
+
+#include "main.h"
+#include "stm32wbxx_hal.h"
+#include "stm32wbxx_hal_def.h"
+#include "stm32wbxx_hal_i2c.h"
+
+extern I2C_HandleTypeDef hi2c3; /* CubeMX-generated (main.c)     */
 
 #define BUS_TMO_MS 100u
 
-STTS22H_Object_t    temp_sensor;
+STTS22H_Object_t temp_sensor;
 ISM330DHCX_Object_t imu;
 
 /* ===================== STUDENT CODE BEGIN — IO glue ===================== */
@@ -67,10 +72,51 @@ ISM330DHCX_Object_t imu;
  *   ...
  */
 
+static int32_t bus_init(void) {
+    /* MX_I2C3_Init() already configured the peripheral. */
+    return 0;
+}
+
+static int32_t bus_deinit(void) {
+    // no op
+    return 0;
+}
+
+static int32_t bus_read(uint16_t addr, uint16_t reg, uint8_t* p, uint16_t len) {
+    HAL_StatusTypeDef result =
+        HAL_I2C_Mem_Read(&hi2c3, addr, reg, I2C_MEMADD_SIZE_8BIT, p, len, BUS_TMO_MS);
+
+    if (result == HAL_OK) {
+        return 0;
+    }
+
+    return -1;
+}
+
+static int32_t bus_write(uint16_t addr, uint16_t reg, uint8_t* p, uint16_t len) {
+    HAL_StatusTypeDef result =
+        HAL_I2C_Mem_Write(&hi2c3, addr, reg, I2C_MEMADD_SIZE_8BIT, p, len, BUS_TMO_MS);
+
+    if (result == HAL_OK) {
+        return 0;
+    }
+
+    return -1;
+}
+
+static uint32_t bus_get_tick() {
+    uint32_t now_ms = HAL_GetTick();
+    if (now_ms > INT32_MAX) {
+        printf("Tick ms value: %lu can't be truncated. Returning garbage.\n", now_ms);
+    }
+    return (int32_t)now_ms;
+}
+
+static void bus_delay(uint32_t ms) { HAL_Delay(ms); }
+
 /* ====================== STUDENT CODE END — IO glue ====================== */
 
-int32_t vitals_bus_init(void)
-{
+int32_t vitals_bus_init(void) {
     /* =================== STUDENT CODE BEGIN — binding =================== */
 
     /* TODO: steps 2a–2e from the header comment, for the two sensors.
