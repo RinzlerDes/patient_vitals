@@ -39,6 +39,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 
+#include "config_table.h"
 #include "console.h"
 #include "main.h"
 #include "oled.h"
@@ -235,11 +236,78 @@ static bool temp_handle_one_shot() {
     return true;
 }
 
+bool ts1_touch_update(uint32_t now, int32_t val) {
+    static const int32_t ts1_pressed_threshold = 2350;
+    static const int32_t ts1_not_pressed_threshold = 2400;
+    static bool present = false;
+    static bool transition_started = false;
+    static uint32_t transition_start = 0;
+    bool is_transition;
+    uint32_t required_transition_duration;
+
+    if (present) {
+        is_transition = val > ts1_not_pressed_threshold;
+        required_transition_duration = cfg_absent_ms;
+    } else {
+        is_transition = val < ts1_pressed_threshold;
+        required_transition_duration = cfg_present_ms;
+    }
+
+    if (!is_transition) {
+        transition_started = false;
+        return present;
+    }
+
+    if (!transition_started) {
+        transition_started = true;
+        transition_start = now;
+        return present;
+    }
+
+    if ((now - transition_start) >= required_transition_duration) {
+        present = !present;
+        transition_started = false;
+    }
+
+    return present;
+
+    // too much nesting, hard to follow first_measurement/transition_started
+    // if (!present) {
+    //     if (val < ts1_pressed_threshold) {
+    //         if (first_measurement) {
+    //             prev = now;
+    //             first_measurement = false;
+    //         }
+    //         if ((now - prev) >= cfg_present_ms) {
+    //             first_measurement = true;
+    //             present = true;
+    //         }
+    //     } else {
+    //         first_measurement = true;
+    //     }
+    // } else {
+    //     if (val > ts1_not_pressed_threshold) {
+    //         if (first_measurement) {
+    //             prev = now;
+    //             first_measurement = false;
+    //         }
+    //         if ((now - prev) >= cfg_absent_ms) {
+    //             present = false;
+    //             first_measurement = true;
+    //         }
+    //     } else {
+    //         first_measurement = true;
+    //     }
+    // }
+
+    // return present;
+}
+
 void app_service(void) {
     static uint32_t touch_last, status_last;
     static int32_t touch_raw = -1;
     uint32_t now = HAL_GetTick();
-    int32_t status = 0;
+    static bool ts1_is_touched = false;
 
     /* Touch sampling — non-blocking, ~10 Hz (R1 groundwork). */
     if ((uint32_t)(now - touch_last) >= TOUCH_PERIOD_MS) {
@@ -247,6 +315,7 @@ void app_service(void) {
         if (v >= 0) {
             touch_raw = v;
             touch_last = now;
+            ts1_is_touched = ts1_touch_update(now, v);
         }
     }
 
@@ -275,5 +344,12 @@ void app_service(void) {
         if (temp_handle_one_shot()) {
             temp_one_shot_active = false;
         }
+    }
+
+    // debug print every second
+    static uint32_t prev_debug_print_ms = 0;
+    if ((now - prev_debug_print_ms) >= 1000) {
+        prev_debug_print_ms = now;
+        printf("ts1 is touched: %u\n", ts1_is_touched);
     }
 }
