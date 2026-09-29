@@ -48,12 +48,17 @@
  */
 #include "vitals_bus.h"
 
+#include <stdint.h>
 #include <stdio.h>
 
+#include "ism330dhcx.h"
+#include "ism330dhcx_reg.h"
 #include "main.h"
 #include "stm32wbxx_hal.h"
 #include "stm32wbxx_hal_def.h"
 #include "stm32wbxx_hal_i2c.h"
+#include "stts22h.h"
+#include "stts22h_reg.h"
 
 extern I2C_HandleTypeDef hi2c3; /* CubeMX-generated (main.c)     */
 
@@ -72,15 +77,9 @@ ISM330DHCX_Object_t imu;
  *   ...
  */
 
-static int32_t bus_init(void) {
-    /* MX_I2C3_Init() already configured the peripheral. */
-    return 0;
-}
+static int32_t bus_init(void) { return 0; }
 
-static int32_t bus_deinit(void) {
-    // no op
-    return 0;
-}
+static int32_t bus_deinit(void) { return 0; }
 
 static int32_t bus_read(uint16_t addr, uint16_t reg, uint8_t* p, uint16_t len) {
     HAL_StatusTypeDef result =
@@ -104,10 +103,15 @@ static int32_t bus_write(uint16_t addr, uint16_t reg, uint8_t* p, uint16_t len) 
     return -1;
 }
 
-static uint32_t bus_get_tick() {
+static int32_t bus_get_tick() {
     uint32_t now_ms = HAL_GetTick();
     if (now_ms > INT32_MAX) {
-        printf("Tick ms value: %lu can't be truncated. Returning garbage.\n", now_ms);
+        printf(
+            "Truncating from uint32_t to int32_t, tick value: %lu that is greater than INT32_MAX: "
+            "%li, to %li\n",
+            now_ms,
+            INT32_MAX,
+            (int32_t)now_ms);
     }
     return (int32_t)now_ms;
 }
@@ -116,13 +120,124 @@ static void bus_delay(uint32_t ms) { HAL_Delay(ms); }
 
 /* ====================== STUDENT CODE END — IO glue ====================== */
 
+static int32_t imu_init() {
+    ISM330DHCX_IO_t ism330dhcx_io = { .Init = bus_init,
+                                      .DeInit = bus_deinit,
+                                      .BusType = ISM330DHCX_I2C_BUS,
+                                      .Address = ISM330DHCX_I2C_ADD_H,
+                                      .WriteReg = bus_write,
+                                      .ReadReg = bus_read,
+                                      .GetTick = bus_get_tick,
+                                      .Delay = bus_delay };
+
+    int32_t status;
+    uint8_t id = 0;
+
+    status = ISM330DHCX_RegisterBusIO(&imu, &ism330dhcx_io);
+    if (status != ISM330DHCX_OK) {
+        printf("Failed to register ISM330DHCX\n");
+        return -1;
+    }
+
+    status = ISM330DHCX_ReadID(&imu, &id);
+    if (status != ISM330DHCX_OK || id != ISM330DHCX_ID) {
+        printf("Failed to read ISM330DHCX, whoami = 0x%X, ISM330DHCX id = 0x%X\n",
+               id,
+               ISM330DHCX_ID);
+        return -1;
+    }
+
+    printf("Found ISM330DHCX, whoami = 0x%X, ISM330DHCX id = 0x%X\n", id, ISM330DHCX_ID);
+
+    status = ISM330DHCX_Init(&imu);
+    if (status != ISM330DHCX_OK) {
+        printf("Failed to init ISM330DHCX\n");
+        return -1;
+    }
+
+    status = ISM330DHCX_ACC_Enable(&imu);
+    if (status != ISM330DHCX_OK) {
+        printf("Failed to enable accelerometer ISM330DHCX\n");
+        return -1;
+    }
+
+    // The IMU default after ACC_Enable is 104 Hz at ±2 g, which is correct for R4.
+
+    return 0;
+}
+
+static int32_t temp_sensor_init() {
+    STTS22H_IO_t stts22h_io = { .Init = bus_init,
+                                .DeInit = bus_deinit,
+                                .BusType = STTS22H_I2C_BUS,
+                                .Address = STTS22H_I2C_ADD_H,
+                                .WriteReg = bus_write,
+                                .ReadReg = bus_read,
+                                .GetTick = bus_get_tick };
+
+    int32_t status;
+    uint8_t id = 0;
+
+    status = STTS22H_RegisterBusIO(&temp_sensor, &stts22h_io);
+    if (status != STTS22H_OK) {
+        printf("Failed to register STTS22H\n");
+        return -1;
+    }
+
+    status = STTS22H_ReadID(&temp_sensor, &id);
+    if (status != STTS22H_OK || id != STTS22H_ID) {
+        printf("Failed to read STTS22H, whoami = 0x%X, STTS22H id = 0x%X\n", id, STTS22H_ID);
+        return -1;
+    }
+
+    printf("Found STTS22H, whoami = 0x%X, STTS22H id = 0x%X\n", id, STTS22H_ID);
+
+    status = STTS22H_Init(&temp_sensor);
+    if (status != STTS22H_OK) {
+        printf("Failed to init STTS22H\n");
+        return -1;
+    }
+
+    // status = STTS22H_Set_One_Shot(&temp_sensor);
+    // if (status != STTS22H_OK) {
+    //     printf("Failed to set one shot STTS22H\n");
+    //     return -1;
+    // }
+
+    // status = STTS22H_TEMP_Enable(&temp_sensor);
+    // if (status != STTS22H_OK) {
+    //     printf("Failed to enable STTS22H\n");
+    //     return -1;
+    // }
+
+    // status = STTS22H_TEMP_SetOutputDataRate(&temp_sensor, 1.0f);
+    // if (status != STTS22H_OK) {
+    //     printf("Failed to set output data rate for STTS22H\n");
+    //     return -1;
+    // }
+
+    return 0;
+}
+
 int32_t vitals_bus_init(void) {
     /* =================== STUDENT CODE BEGIN — binding =================== */
 
     /* TODO: steps 2a–2e from the header comment, for the two sensors.
      * Erase the two lines below when you start. */
-    printf("vitals_bus_init: NOT IMPLEMENTED (see App/vitals_bus.c)\n");
-    return -1;
+    // printf("vitals_bus_init: NOT IMPLEMENTED (see App/vitals_bus.c)\n");
+    // return -1;
+
+    int32_t status;
+
+    status = temp_sensor_init();
+    if (status != 0) {
+        return -1;
+    }
+    status = imu_init();
+    if (status != 0) {
+        return -1;
+    }
+    return 0;
 
     /* ==================== STUDENT CODE END — binding ==================== */
 }
