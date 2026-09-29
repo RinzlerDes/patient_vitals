@@ -34,14 +34,18 @@
  *  HAL does not change it.
  ******************************************************************************
  */
-#include <stdio.h>
-#include "main.h"
 #include "app.h"
+
+#include <stdbool.h>
+#include <stdio.h>
+
 #include "console.h"
+#include "main.h"
 #include "oled.h"
+#include "stts22h.h"
 #include "vitals_bus.h"
 
-extern I2C_HandleTypeDef hi2c3;          /* CubeMX-generated handles      */
+extern I2C_HandleTypeDef hi2c3; /* CubeMX-generated handles      */
 extern TSC_HandleTypeDef htsc;
 
 /* Sensor 7-bit addresses as this board straps them (UM2825 tbl 11), in the
@@ -53,19 +57,27 @@ extern TSC_HandleTypeDef htsc;
 #define ADDR_STTS22H    (0x38u << 1)
 #define ADDR_ISM330DHCX (0x6Bu << 1)
 
-#define TOUCH_PERIOD_MS   100u
-#define STATUS_PERIOD_MS  500u
+#define TOUCH_PERIOD_MS  100u
+#define STATUS_PERIOD_MS 500u
 
 /* EXTI press counters. The ISR writes them, and the loop reads them (R23). */
 static volatile uint32_t b1_presses, b2_presses, imu_int1_events;
 
-void HAL_GPIO_EXTI_Callback(uint16_t pin)
-{
+void HAL_GPIO_EXTI_Callback(uint16_t pin) {
     /* ISR rule (R23): latch the event and return. No I2C, no printf, and
      * no OLED work here. */
-    if (pin == User_B1_Pin)  { b1_presses++; }
-    if (pin == User_B2_Pin)  { b2_presses++; }
-    if (pin == INT1_Pin)     { imu_int1_events++; }
+    if (pin == User_B1_Pin) {
+        b1_presses++;
+    }
+    if (pin == User_B2_Pin) {
+        b2_presses++;
+    }
+    if (pin == INT1_Pin) {
+        imu_int1_events++;
+    }
+    // if (pin == DRDY_Pin) {
+    //     temp_drdy_flag = true;
+    // }
 }
 
 /*
@@ -81,54 +93,51 @@ void HAL_GPIO_EXTI_Callback(uint16_t pin)
  * acquisition ends. This is the R1 worked example, and your presence
  * gate adds hysteresis above it.
  */
-static int32_t touch_read_raw(void)
-{
+static int32_t touch_read_raw(void) {
     static enum { T_IDLE, T_DISCHARGE, T_ACQUIRE } phase = T_IDLE;
     static uint32_t t_phase;
     uint32_t now = HAL_GetTick();
 
     switch (phase) {
-    case T_IDLE:
-        HAL_TSC_IODischarge(&htsc, ENABLE);
-        t_phase = now;
-        phase = T_DISCHARGE;
-        return -1;
-
-    case T_DISCHARGE:
-        if ((uint32_t)(now - t_phase) < 2u) {
-            return -1;                   /* let the electrodes drain      */
-        }
-        HAL_TSC_IODischarge(&htsc, DISABLE);
-        HAL_TSC_Start(&htsc);
-        phase = T_ACQUIRE;
-        return -1;
-
-    case T_ACQUIRE:
-    default:
-        /* A max-count error (MCE) stops the acquisition and does NOT set
-         * the group-complete flag. Code that polls only for the end of an
-         * acquisition stops here forever after one such error. Your R1
-         * presence gate must also survive a stopped acquisition.      */
-        if (__HAL_TSC_GET_FLAG(&htsc, TSC_FLAG_MCE)) {
-            HAL_TSC_Stop(&htsc);         /* clears EOA/MCE, back to READY */
-            phase = T_IDLE;
+        case T_IDLE:
+            HAL_TSC_IODischarge(&htsc, ENABLE);
+            t_phase = now;
+            phase = T_DISCHARGE;
             return -1;
-        }
-        if (HAL_TSC_GroupGetStatus(&htsc, TSC_GROUP6_IDX)
-            != TSC_GROUP_COMPLETED) {
-            return -1;                   /* still counting: come back     */
-        }
-        {
-            int32_t v = (int32_t)HAL_TSC_GroupGetValue(&htsc, TSC_GROUP6_IDX);
-            HAL_TSC_Stop(&htsc);
-            phase = T_IDLE;
-            return v;
-        }
+
+        case T_DISCHARGE:
+            if ((uint32_t)(now - t_phase) < 2u) {
+                return -1; /* let the electrodes drain      */
+            }
+            HAL_TSC_IODischarge(&htsc, DISABLE);
+            HAL_TSC_Start(&htsc);
+            phase = T_ACQUIRE;
+            return -1;
+
+        case T_ACQUIRE:
+        default:
+            /* A max-count error (MCE) stops the acquisition and does NOT set
+             * the group-complete flag. Code that polls only for the end of an
+             * acquisition stops here forever after one such error. Your R1
+             * presence gate must also survive a stopped acquisition.      */
+            if (__HAL_TSC_GET_FLAG(&htsc, TSC_FLAG_MCE)) {
+                HAL_TSC_Stop(&htsc); /* clears EOA/MCE, back to READY */
+                phase = T_IDLE;
+                return -1;
+            }
+            if (HAL_TSC_GroupGetStatus(&htsc, TSC_GROUP6_IDX) != TSC_GROUP_COMPLETED) {
+                return -1; /* still counting: come back     */
+            }
+            {
+                int32_t v = (int32_t)HAL_TSC_GroupGetValue(&htsc, TSC_GROUP6_IDX);
+                HAL_TSC_Stop(&htsc);
+                phase = T_IDLE;
+                return v;
+            }
     }
 }
 
-void app_init(void)
-{
+void app_init(void) {
     console_init();
     oled_init();
 
@@ -160,11 +169,77 @@ void app_init(void)
     }
 }
 
-void app_service(void)
-{
+void float_split(float input, uint32_t decimal_places, bool* out_is_positive, uint32_t* out_whole,
+                 uint32_t* out_fraction) {
+    if (input < 0.0f) {
+        *out_is_positive = false;
+        input = -input;
+    } else {
+        *out_is_positive = true;
+    }
+
+    uint32_t scale = 1;
+    for (uint32_t i = 0; i < decimal_places; i++) {
+        scale *= 10;
+    }
+
+    uint32_t scaled = (uint32_t)(input * scale + 0.5);
+
+    *out_whole = scaled / scale;
+    *out_fraction = scaled % scale;
+}
+
+static bool temp_start_one_shot_if_due(uint32_t now) {
+    static uint32_t temp_prev_start_ms = 0;
+
+    if (now - temp_prev_start_ms < 1000ul) {
+        return false;
+    }
+
+    int32_t status = STTS22H_Set_One_Shot(&temp_sensor);
+    if (status != STTS22H_OK) {
+        printf("Failed to start temp one shot\n");
+        return false;
+    }
+
+    temp_prev_start_ms = now;
+    return true;
+}
+
+static bool temp_handle_one_shot() {
+    uint8_t drdy_status = 0;
+    int32_t status = STTS22H_TEMP_Get_DRDY_Status(&temp_sensor, &drdy_status);
+
+    if (status != STTS22H_OK) {
+        printf("Failed to get temp drdy status\n");
+        return false;
+    } else if (drdy_status != 1) {
+        return false;
+    }
+
+    float val = 0;
+    uint32_t temp_whole = 0;
+    uint32_t temp_fraction = 0;
+    bool temp_is_positive = true;
+
+    status = STTS22H_TEMP_GetTemperature(&temp_sensor, &val);
+    if (status != STTS22H_OK) {
+        printf("get temp failed\n");
+        return false;
+    }
+
+    float_split(val, 1, &temp_is_positive, &temp_whole, &temp_fraction);
+    char* sign = temp_is_positive ? "" : "-";
+    printf("temp: %s%lu.%lu c\n", sign, temp_whole, temp_fraction);
+
+    return true;
+}
+
+void app_service(void) {
     static uint32_t touch_last, status_last;
-    static int32_t  touch_raw = -1;
+    static int32_t touch_raw = -1;
     uint32_t now = HAL_GetTick();
+    int32_t status = 0;
 
     /* Touch sampling — non-blocking, ~10 Hz (R1 groundwork). */
     if ((uint32_t)(now - touch_last) >= TOUCH_PERIOD_MS) {
@@ -179,8 +254,7 @@ void app_service(void)
     if ((uint32_t)(now - status_last) >= STATUS_PERIOD_MS) {
         status_last = now;
         oled_printf(4, "touch %5ld", (long)touch_raw);
-        oled_printf(5, "B1 x%lu  B2 x%lu",
-                    (unsigned long)b1_presses, (unsigned long)b2_presses);
+        oled_printf(5, "B1 x%lu  B2 x%lu", (unsigned long)b1_presses, (unsigned long)b2_presses);
     }
 
     /* Console echo — the one non-blocking console call (R20). */
@@ -191,6 +265,15 @@ void app_service(void)
             fflush(stdout);
         } else if (ch == '\r') {
             printf("\n");
+        }
+    }
+
+    static bool temp_one_shot_active = false;
+    if (!temp_one_shot_active) {
+        temp_one_shot_active = temp_start_one_shot_if_due(now);
+    } else {
+        if (temp_handle_one_shot()) {
+            temp_one_shot_active = false;
         }
     }
 }
