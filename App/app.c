@@ -68,7 +68,7 @@ typedef enum { STANDBY, MONITOR } device_mode_t;
 /* EXTI press counters. The ISR writes them, and the loop reads them (R23). */
 static volatile uint32_t b1_presses, b2_presses, imu_int1_events;
 static device_mode_t device_mode = STANDBY;
-static uint32_t monitor_start_ms = 0;
+// static uint32_t monitor_start_ms = 0;
 static bool sensors_ready = false;
 static volatile bool imu_axes_ready = false;
 static volatile bool print_debug_flag = false;
@@ -77,6 +77,10 @@ static float calibration_offset = 0;
 // static float angle_raw = 0;
 static float angle_smoothed = 0;
 static float angle_calibrated = 0;
+
+static uint32_t last_reposition_ms = 0;
+static float angle_at_last_reset = 0;
+static bool turn_due = false;
 
 void HAL_GPIO_EXTI_Callback(uint16_t pin) {
     /* ISR rule (R23): latch the event and return. No I2C, no printf, and
@@ -302,8 +306,11 @@ static void service_device_mode(uint32_t now, bool ts1_is_touched) {
     switch (device_mode) {
         case STANDBY:
             if (ts1_is_touched && sensors_ready) {
-                monitor_start_ms = now;
+                // monitor_start_ms = now;
                 device_mode = MONITOR;
+                last_reposition_ms = now;
+                angle_at_last_reset = angle_calibrated;
+                turn_due = false;
                 log_event(now, "Device mode: Standby -> Monitor\n");
             }
             break;
@@ -399,6 +406,43 @@ static void console_handle_line(uint32_t now) {
     }
 }
 
+static void service_posture_change(uint32_t now) {
+    static bool transition_started = false;
+    static uint32_t transition_start = 0;
+
+    float angle_delta = fabsf(angle_calibrated - angle_at_last_reset);
+    float required_delta = cfg_delta_turn_tenths / 10.0f;
+
+    if (angle_delta < required_delta) {
+        transition_started = false;
+        return;
+    }
+
+    if (!transition_started) {
+        transition_started = true;
+        transition_start = now;
+        return;
+    }
+
+    if ((now - transition_start) >= (cfg_t_hold_s * 1000)) {
+        last_reposition_ms = now;
+        angle_at_last_reset = angle_calibrated;
+        transition_started = false;
+
+        if (turn_due) {
+            turn_due = false;
+            log_event(now, "TURN-DUE cleared after posture change\n");
+        }
+    }
+}
+
+static void service_turn_due(uint32_t now) {
+    if (!turn_due && (now - last_reposition_ms) >= (cfg_turn_interval_s * 1000)) {
+        turn_due = true;
+        log_event(now, "TURN-DUE\n");
+    }
+}
+
 void app_service(void) {
     static uint32_t touch_last, status_last;
     static int32_t touch_raw = -1;
@@ -407,7 +451,8 @@ void app_service(void) {
     static ISM330DHCX_Axes_t imu_axes;
     static bool success = false;
 
-    // SENSOR WORK ----------------------------------------------------------------------------------------------------
+    // SENSOR WORK
+    // ----------------------------------------------------------------------------------------------------
     /* Touch sampling — non-blocking, ~10 Hz (R1 groundwork). */
     if ((uint32_t)(now - touch_last) >= TOUCH_PERIOD_MS) {
         int32_t v = touch_read_raw();
@@ -438,7 +483,8 @@ void app_service(void) {
         }
         // if (!success)
     }
-    // SENSOR WORK ----------------------------------------------------------------------------------------------------
+    // SENSOR WORK
+    // ----------------------------------------------------------------------------------------------------
 
     console_handle_line(now);
 
@@ -446,7 +492,8 @@ void app_service(void) {
     // if ((uint32_t)(now - status_last) >= STATUS_PERIOD_MS) {
     //     status_last = now;
     //     oled_printf(4, "touch %5ld", (long)touch_raw);
-    //     oled_printf(5, "B1 x%lu  B2 x%lu", (unsigned long)b1_presses, (unsigned long)b2_presses);
+    //     oled_printf(5, "B1 x%lu  B2 x%lu", (unsigned long)b1_presses, (unsigned
+    //     long)b2_presses);
     // }
 
     // /* Console echo — the one non-blocking console call (R20). */
@@ -460,9 +507,13 @@ void app_service(void) {
     //     }
     // }
 
-
     // update_device_mode(now, ts1_is_touched);
     service_device_mode(now, ts1_is_touched);
+
+    if (device_mode == MONITOR) {
+        service_posture_change(now);
+        service_turn_due(now);
+    }
 
     // debug print every second
     static uint32_t prev_debug_print_ms = 0;
