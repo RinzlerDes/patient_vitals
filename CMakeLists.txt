@@ -52,6 +52,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     App/qualify.c
     App/ui_pages.c
     App/vitals_bus.c
+    App/clock.c
+    App/rgb_led.c
     Drivers/Components/stts22h/stts22h.c
     Drivers/Components/stts22h/stts22h_reg.c
     Drivers/Components/ism330dhcx/ism330dhcx.c
