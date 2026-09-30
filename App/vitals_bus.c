@@ -161,6 +161,18 @@ static int32_t imu_init() {
         return -1;
     }
 
+    status = ISM330DHCX_ACC_Enable_DRDY_On_INT1(&imu);
+    if (status != ISM330DHCX_OK) {
+        printf("Failed to enable INT1 DRDY ISM330DHCX\n");
+        return -1;
+    }
+
+    status = ISM330DHCX_DRDY_Set_Mode(&imu, ISM330DHCX_DRDY_PULSED);
+    if (status != ISM330DHCX_OK) {
+        printf("Failed to set pulsed DRDY ISM330DHCX\n");
+        return -1;
+    }
+
     // The IMU default after ACC_Enable is 104 Hz at ±2 g, which is correct for R4.
 
     return 0;

@@ -41,6 +41,7 @@
 
 #include "config_table.h"
 #include "console.h"
+#include "ism330dhcx.h"
 #include "main.h"
 #include "oled.h"
 #include "stts22h.h"
@@ -60,21 +61,36 @@ extern TSC_HandleTypeDef htsc;
 
 #define TOUCH_PERIOD_MS  100u
 #define STATUS_PERIOD_MS 500u
+#define TEMP_PERIOD_MS   1000u
+
+typedef enum { STANDBY, MONITOR } device_mode_t;
 
 /* EXTI press counters. The ISR writes them, and the loop reads them (R23). */
 static volatile uint32_t b1_presses, b2_presses, imu_int1_events;
+static device_mode_t device_mode = STANDBY;
+static uint32_t monitor_start_ms = 0;
+static bool sensors_ready = false;
+static volatile bool imu_axes_ready = false;
+static volatile bool print_debug_flag = false;
+
+static float calibration_offset = 0;
+// static float angle_raw = 0;
+static float angle_smoothed = 0;
+static float angle_calibrated = 0;
 
 void HAL_GPIO_EXTI_Callback(uint16_t pin) {
     /* ISR rule (R23): latch the event and return. No I2C, no printf, and
      * no OLED work here. */
     if (pin == User_B1_Pin) {
         b1_presses++;
+        print_debug_flag = true;
     }
     if (pin == User_B2_Pin) {
         b2_presses++;
     }
     if (pin == INT1_Pin) {
         imu_int1_events++;
+        imu_axes_ready = true;
     }
     // if (pin == DRDY_Pin) {
     //     temp_drdy_flag = true;
@@ -165,7 +181,11 @@ void app_init(void) {
     printf("\n");
 
     /* Your first task: make this call succeed (App/vitals_bus.c). */
-    if (vitals_bus_init() == 0) {
+    if (vitals_bus_init() != 0) {
+        sensors_ready = false;
+        printf("Failed component drivers bound: WHO_AM_I not verified\n");
+    } else {
+        sensors_ready = true;
         printf("component drivers bound: WHO_AM_I verified\n");
     }
 }
@@ -193,7 +213,7 @@ void float_split(float input, uint32_t decimal_places, bool* out_is_positive, ui
 static bool temp_start_one_shot_if_due(uint32_t now) {
     static uint32_t temp_prev_start_ms = 0;
 
-    if (now - temp_prev_start_ms < 1000ul) {
+    if ((now - temp_prev_start_ms) < TEMP_PERIOD_MS) {
         return false;
     }
 
@@ -207,7 +227,7 @@ static bool temp_start_one_shot_if_due(uint32_t now) {
     return true;
 }
 
-static bool temp_handle_one_shot() {
+static bool temp_handle_one_shot(float* out_temp) {
     uint8_t drdy_status = 0;
     int32_t status = STTS22H_TEMP_Get_DRDY_Status(&temp_sensor, &drdy_status);
 
@@ -229,9 +249,11 @@ static bool temp_handle_one_shot() {
         return false;
     }
 
-    float_split(val, 1, &temp_is_positive, &temp_whole, &temp_fraction);
-    char* sign = temp_is_positive ? "" : "-";
-    printf("temp: %s%lu.%lu c\n", sign, temp_whole, temp_fraction);
+    // float_split(val, 1, &temp_is_positive, &temp_whole, &temp_fraction);
+    // char* sign = temp_is_positive ? "" : "-";
+    // printf("temp: %s%lu.%lu c\n", sign, temp_whole, temp_fraction);
+
+    *out_temp = val;
 
     return true;
 }
@@ -270,37 +292,111 @@ bool ts1_touch_update(uint32_t now, int32_t val) {
     }
 
     return present;
+}
 
-    // too much nesting, hard to follow first_measurement/transition_started
-    // if (!present) {
-    //     if (val < ts1_pressed_threshold) {
-    //         if (first_measurement) {
-    //             prev = now;
-    //             first_measurement = false;
-    //         }
-    //         if ((now - prev) >= cfg_present_ms) {
-    //             first_measurement = true;
-    //             present = true;
-    //         }
-    //     } else {
-    //         first_measurement = true;
-    //     }
-    // } else {
-    //     if (val > ts1_not_pressed_threshold) {
-    //         if (first_measurement) {
-    //             prev = now;
-    //             first_measurement = false;
-    //         }
-    //         if ((now - prev) >= cfg_absent_ms) {
-    //             present = false;
-    //             first_measurement = true;
-    //         }
-    //     } else {
-    //         first_measurement = true;
-    //     }
-    // }
+static void log_event(uint32_t now, const char* message) {
+    printf("[%04lu.%03lu] %s", now / 1000, now % 1000, message);
+}
 
-    // return present;
+static void service_device_mode(uint32_t now, bool ts1_is_touched) {
+    switch (device_mode) {
+        case STANDBY:
+            if (ts1_is_touched && sensors_ready) {
+                monitor_start_ms = now;
+                device_mode = MONITOR;
+                log_event(now, "Device mode: Standby -> Monitor\n");
+            }
+            break;
+        case MONITOR:
+            if (!ts1_is_touched) {
+                device_mode = STANDBY;
+                log_event(now, "Device mode: Monitor -> Standby");
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+static bool imu_read(ISM330DHCX_Axes_t* out_axes) {
+    if (!imu_axes_ready) {
+        return false;
+    }
+    int32_t status = ISM330DHCX_ACC_GetAxes(&imu, out_axes);
+    if (status != ISM330DHCX_OK) {
+        printf("Failed imu acc get axes\n");
+        return false;
+    }
+
+    return true;
+}
+
+static float calc_angle(const ISM330DHCX_Axes_t* axes) {
+    return atan2f(-axes->x, axes->z) * 180.0f / 3.14159265f;
+}
+
+static float smooth_angle(float new_angle) {
+    enum { SAMPLE_SIZE = 4 };
+    static float samples[SAMPLE_SIZE] = { 0 };
+    static uint32_t index = 0;
+    static uint32_t count = 0;
+
+    samples[index] = new_angle;
+    index = (index + 1) % SAMPLE_SIZE;
+
+    if (count < SAMPLE_SIZE) {
+        count++;
+    }
+
+    float sum = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        sum += samples[i];
+    }
+
+    return sum / count;
+}
+
+static void console_handle_custom_command(uint32_t now, char* str) {
+    if (strcmp(str, "CAL") == 0) {
+        calibration_offset = angle_smoothed;
+        angle_calibrated = 0;
+
+        log_event(now, "Angle calibrated\n");
+    }
+}
+
+static void console_handle_line(uint32_t now) {
+    enum { CMD_SIZE = 64 };
+    static char cmd[CMD_SIZE];
+    static uint32_t cmd_len = 0;
+
+    int ch = console_poll();
+    if (ch < 0) {
+        return;
+    }
+
+    if (ch == '\r') {
+        cmd[cmd_len] = '\0';
+        printf("\n");
+        // console_handle_line(now, cmd);
+        config_cmd_result_t result = config_table_command(cmd, NULL);
+        if (result == CFG_CMD_NOT_MINE) {
+            console_handle_custom_command(now, cmd);
+        }
+        cmd_len = 0;
+        cmd[0] = 0;
+        return;
+    }
+
+    if (ch >= 0x20 && ch <= 0x7E) {
+        if (cmd_len < CMD_SIZE - 1) {
+            cmd[cmd_len] = ch;
+            cmd_len++;
+            putchar(ch);
+        }
+    }
 }
 
 void app_service(void) {
@@ -308,7 +404,10 @@ void app_service(void) {
     static int32_t touch_raw = -1;
     uint32_t now = HAL_GetTick();
     static bool ts1_is_touched = false;
+    static ISM330DHCX_Axes_t imu_axes;
+    static bool success = false;
 
+    // SENSOR WORK ----------------------------------------------------------------------------------------------------
     /* Touch sampling — non-blocking, ~10 Hz (R1 groundwork). */
     if ((uint32_t)(now - touch_last) >= TOUCH_PERIOD_MS) {
         int32_t v = touch_read_raw();
@@ -319,37 +418,68 @@ void app_service(void) {
         }
     }
 
-    /* Status line — on change cadence, cheap (R18 discipline). */
-    if ((uint32_t)(now - status_last) >= STATUS_PERIOD_MS) {
-        status_last = now;
-        oled_printf(4, "touch %5ld", (long)touch_raw);
-        oled_printf(5, "B1 x%lu  B2 x%lu", (unsigned long)b1_presses, (unsigned long)b2_presses);
-    }
-
-    /* Console echo — the one non-blocking console call (R20). */
-    {
-        int ch = console_poll();
-        if (ch >= 0x20 && ch <= 0x7E) {
-            putchar(ch);
-            fflush(stdout);
-        } else if (ch == '\r') {
-            printf("\n");
-        }
-    }
-
     static bool temp_one_shot_active = false;
+    static float temp_current = 0;
     if (!temp_one_shot_active) {
         temp_one_shot_active = temp_start_one_shot_if_due(now);
     } else {
-        if (temp_handle_one_shot()) {
+        if (temp_handle_one_shot(&temp_current)) {
             temp_one_shot_active = false;
         }
     }
 
+    if (imu_axes_ready) {
+        success = imu_read(&imu_axes);
+        imu_axes_ready = false;
+        if (success) {
+            float angle_raw = calc_angle(&imu_axes);
+            angle_smoothed = smooth_angle(angle_raw);
+            angle_calibrated = angle_smoothed - calibration_offset;
+        }
+        // if (!success)
+    }
+    // SENSOR WORK ----------------------------------------------------------------------------------------------------
+
+    console_handle_line(now);
+
+    // /* Status line — on change cadence, cheap (R18 discipline). */
+    // if ((uint32_t)(now - status_last) >= STATUS_PERIOD_MS) {
+    //     status_last = now;
+    //     oled_printf(4, "touch %5ld", (long)touch_raw);
+    //     oled_printf(5, "B1 x%lu  B2 x%lu", (unsigned long)b1_presses, (unsigned long)b2_presses);
+    // }
+
+    // /* Console echo — the one non-blocking console call (R20). */
+    // {
+    //     int ch = console_poll();
+    //     if (ch >= 0x20 && ch <= 0x7E) {
+    //         putchar(ch);
+    //         fflush(stdout);
+    //     } else if (ch == '\r') {
+    //         printf("\n");
+    //     }
+    // }
+
+
+    // update_device_mode(now, ts1_is_touched);
+    service_device_mode(now, ts1_is_touched);
+
     // debug print every second
     static uint32_t prev_debug_print_ms = 0;
-    if ((now - prev_debug_print_ms) >= 1000) {
+    // if ((now - prev_debug_print_ms) >= 1000) {
+    if (print_debug_flag) {
+        print_debug_flag = false;
+        uint32_t whole = 0;
+        uint32_t fraction = 0;
+        bool is_positive = false;
+
         prev_debug_print_ms = now;
+        printf("now: %lu\n", now);
         printf("ts1 is touched: %u\n", ts1_is_touched);
+        printf("accel: x=%ld y=%ld z=%ld mg\n", imu_axes.x, imu_axes.y, imu_axes.z);
+
+        float_split(angle_calibrated, 1, &is_positive, &whole, &fraction);
+
+        printf("angle: %s%lu.%lu\n", is_positive ? "" : "-", whole, fraction);
     }
 }
