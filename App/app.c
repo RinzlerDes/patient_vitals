@@ -48,6 +48,7 @@
 #include "qualify.h"
 #include "rgb_led.h"
 #include "stts22h.h"
+#include "ui_pages.h"
 #include "vitals_bus.h"
 
 extern I2C_HandleTypeDef hi2c3; /* CubeMX-generated handles      */
@@ -79,6 +80,9 @@ typedef struct {
 
 /* EXTI press counters. The ISR writes them, and the loop reads them (R23). */
 static volatile uint32_t b1_presses, b2_presses, imu_int1_events;
+
+static bool ts1_is_touched = false;
+
 static device_mode_t device_mode = STANDBY;
 // static uint32_t monitor_start_ms = 0;
 static bool sensors_ready = false;
@@ -133,10 +137,58 @@ static alert_t temp_rise_alert;
 static bool b1_pressed = false;
 static bool b2_pressed = false;
 
+static uint32_t mode_start_ms = 0;
+static uint32_t session_event_count = 0;
+static uint32_t session_alert_count = 0;
+
+void float_split(float input, uint32_t decimal_places, bool* out_is_positive, uint32_t* out_whole,
+                 uint32_t* out_fraction) {
+    if (input < 0.0f) {
+        *out_is_positive = false;
+        input = -input;
+    } else {
+        *out_is_positive = true;
+    }
+
+    uint32_t scale = 1;
+    for (uint32_t i = 0; i < decimal_places; i++) {
+        scale *= 10;
+    }
+
+    uint32_t scaled = (uint32_t)(input * scale + 0.5);
+
+    *out_whole = scaled / scale;
+    *out_fraction = scaled % scale;
+}
+
+static void uint32_split_ms(uint32_t value_ms, uint32_t* out_whole, uint32_t* out_fraction) {
+    *out_whole = value_ms / 1000;
+    *out_fraction = value_ms % 1000;
+}
+
+static bool temp_start_one_shot(uint32_t now) {
+    static uint32_t temp_prev_start_ms = 0;
+
+    if ((now - temp_prev_start_ms) < TEMP_PERIOD_MS) {
+        return false;
+    }
+
+    int32_t status = STTS22H_Set_One_Shot(&temp_sensor);
+    if (status != STTS22H_OK) {
+        printf("Failed to start temp one shot\n");
+        return false;
+    }
+
+    temp_prev_start_ms = now;
+    return true;
+}
+
 static void alert_start(alert_t* alert, uint32_t now) {
     alert->start_ms = now;
     alert->ack_ms = 0;
     alert->acknowledged = false;
+
+    session_alert_count++;
 }
 
 static void alert_clear(alert_t* alert) {
@@ -244,9 +296,129 @@ static int32_t touch_read_raw(void) {
     }
 }
 
+static void render_live(void) {
+    char value[16];
+    uint32_t whole;
+    uint32_t fraction;
+    bool positive;
+
+    ui_row_put(1, "MODE", device_mode == MONITOR ? "MONITOR" : "STANDBY");
+
+    ui_row_put(2, "PRESENT", ts1_is_touched ? "YES" : "NO");
+
+    float_split(angle_calibrated, 1, &positive, &whole, &fraction);
+    snprintf(value, sizeof(value), "%s%lu.%lu deg", positive ? "" : "-", whole, fraction);
+    ui_row_put(3, "ANGLE", value);
+
+    float_split(temp_smoothed, 1, &positive, &whole, &fraction);
+    snprintf(value, sizeof(value), "%s%lu.%lu C", positive ? "" : "-", whole, fraction);
+    ui_row_put(4, "TEMP", value);
+
+    if (temp_smoothed_baseline_ready) {
+        float_split(temp_smoothed_baseline, 1, &positive, &whole, &fraction);
+        snprintf(value, sizeof(value), "%s%lu.%lu C", positive ? "" : "-", whole, fraction);
+    } else {
+        snprintf(value, sizeof(value), "--");
+    }
+
+    ui_row_put(5, "BASELINE", value);
+
+    snprintf(value,
+             sizeof(value),
+             "%ld.%ld deg",
+             (long)(cfg_hob_limit_tenths / 10),
+             (long)(cfg_hob_limit_tenths % 10));
+    ui_row_put(6, "HOB LIM", value);
+
+    snprintf(value,
+             sizeof(value),
+             "%ld.%ld C",
+             (long)(cfg_delta_t_tenths / 10),
+             (long)(cfg_delta_t_tenths % 10));
+    ui_row_put(7, "TEMP LIM", value);
+}
+
+static void render_clocks(void) {
+    char value[16];
+    uint32_t now = HAL_GetTick();
+
+    uint32_t turn_seconds = 0;
+
+    if (device_mode == MONITOR) {
+        turn_seconds = (now - last_reposition_ms) / 1000;
+    }
+
+    snprintf(value, sizeof(value), "%02lu:%02lu", turn_seconds / 60, turn_seconds % 60);
+    ui_row_put(1, "TURN", value);
+
+    snprintf(value, sizeof(value), "%ld s", (long)cfg_turn_interval_s);
+    ui_row_put(2, "INTERVAL", value);
+
+    uint32_t state_seconds = (now - mode_start_ms) / 1000;
+
+    snprintf(value, sizeof(value), "%02lu:%02lu", state_seconds / 60, state_seconds % 60);
+    ui_row_put(3, "IN STATE", value);
+
+    ui_row_put(4, "MODE", device_mode == MONITOR ? "MONITOR" : "STANDBY");
+
+    ui_row_put(5, "TURN DUE", turn_due ? "YES" : "NO");
+}
+
+static void render_session(void) {
+    char value[16];
+
+    snprintf(value, sizeof(value), "%lu", session_event_count);
+    ui_row_put(1, "EVENTS", value);
+
+    snprintf(value, sizeof(value), "%lu", session_alert_count);
+    ui_row_put(2, "ALERTS", value);
+
+    ui_row_put(3, "TURN", turn_due ? (turn_due_alert.acknowledged ? "ACK" : "ACTIVE") : "OFF");
+
+    ui_row_put(4, "HOB", HOB_is_high ? (hob_high_alert.acknowledged ? "ACK" : "ACTIVE") : "OFF");
+
+    ui_row_put(5, "TEMP", temp_is_high ? (temp_rise_alert.acknowledged ? "ACK" : "ACTIVE") : "OFF");
+}
+
+static void service_ui_banner(void) {
+    static alert_type_t previous_alert = ALERT_NONE;
+
+    alert_type_t alert = alert_highest_priority();
+
+    if (alert == previous_alert) {
+        return;
+    }
+
+    previous_alert = alert;
+
+    switch (alert) {
+        case ALERT_TURN_DUE:
+            ui_pages_banner("TURN-DUE");
+            break;
+
+        case ALERT_HOB_HIGH:
+            ui_pages_banner("HOB-HIGH");
+            break;
+
+        case ALERT_TEMP_RISE:
+            ui_pages_banner("TEMP-RISE");
+            break;
+
+        case ALERT_NONE:
+            ui_pages_banner(NULL);
+            break;
+    }
+}
+
 void app_init(void) {
     console_init();
     oled_init();
+
+    ui_pages_init();
+
+    ui_pages_register(UI_PAGE_LIVE, "LIVE", render_live);
+    ui_pages_register(UI_PAGE_CLOCKS, "CLOCKS", render_clocks);
+    ui_pages_register(UI_PAGE_SESSION, "SESSION", render_session);
 
     dwt_init();
     rgb_init();
@@ -281,48 +453,17 @@ void app_init(void) {
         sensors_ready = true;
         printf("component drivers bound: WHO_AM_I verified\n");
     }
-}
 
-void float_split(float input, uint32_t decimal_places, bool* out_is_positive, uint32_t* out_whole,
-                 uint32_t* out_fraction) {
-    if (input < 0.0f) {
-        *out_is_positive = false;
-        input = -input;
-    } else {
-        *out_is_positive = true;
+    printf("Thresholds:\n");
+
+    for (int i = 0; i < config_table_count(); i++) {
+        const config_entry_t* entry = config_table_entry(i);
+        char value[16];
+
+        config_table_format(entry, value, sizeof(value));
+
+        printf("  %s = %s %s\n", entry->name, value, entry->unit);
     }
-
-    uint32_t scale = 1;
-    for (uint32_t i = 0; i < decimal_places; i++) {
-        scale *= 10;
-    }
-
-    uint32_t scaled = (uint32_t)(input * scale + 0.5);
-
-    *out_whole = scaled / scale;
-    *out_fraction = scaled % scale;
-}
-
-static void uint32_split_ms(uint32_t value_ms, uint32_t* out_whole, uint32_t* out_fraction) {
-    *out_whole = value_ms / 1000;
-    *out_fraction = value_ms % 1000;
-}
-
-static bool temp_start_one_shot(uint32_t now) {
-    static uint32_t temp_prev_start_ms = 0;
-
-    if ((now - temp_prev_start_ms) < TEMP_PERIOD_MS) {
-        return false;
-    }
-
-    int32_t status = STTS22H_Set_One_Shot(&temp_sensor);
-    if (status != STTS22H_OK) {
-        printf("Failed to start temp one shot\n");
-        return false;
-    }
-
-    temp_prev_start_ms = now;
-    return true;
 }
 
 static bool temp_handle_one_shot(float* out_temp) {
@@ -394,6 +535,7 @@ bool ts1_touch_update(uint32_t now, int32_t val) {
 }
 
 static void log_event(uint32_t now, const char* message) {
+    session_event_count++;
     printf("[%04lu.%03lu] %s", now / 1000, now % 1000, message);
 }
 
@@ -410,13 +552,38 @@ static void service_device_mode(uint32_t now, bool ts1_is_touched) {
                 temp_smoother.count = 0;
                 temp_smoother.index = 0;
                 temp_is_high = false;
+                mode_start_ms = now;
+                session_event_count = 0;
+                session_alert_count = 0;
                 qualify_init(&temp_qualify, cfg_delta_t_tenths, 0, 0, now);
                 log_event(now, "Device mode: Standby -> Monitor\n");
             }
             break;
         case MONITOR:
             if (!ts1_is_touched) {
+                if (turn_due) {
+                    log_event(now, "TURN-DUE cancelled\n");
+                }
+
+                if (HOB_is_high) {
+                    log_event(now, "HOB-HIGH cancelled\n");
+                }
+
+                if (temp_is_high) {
+                    log_event(now, "TEMP-RISE cancelled\n");
+                }
+
+                turn_due = false;
+                HOB_is_high = false;
+                temp_is_high = false;
+
+                alert_clear(&turn_due_alert);
+                alert_clear(&hob_high_alert);
+                alert_clear(&temp_rise_alert);
+
                 device_mode = STANDBY;
+                mode_start_ms = now;
+
                 log_event(now, "Device mode: Monitor -> Standby\n");
             }
             break;
@@ -465,12 +632,87 @@ static float calc_angle(const ISM330DHCX_Axes_t* axes) {
 //     return sum / count;
 // }
 
+static const char* alert_state(bool condition, const alert_t* alert) {
+    if (!condition) {
+        return "OFF";
+    }
+
+    if (alert->acknowledged) {
+        return "ACK";
+    }
+
+    return "ACTIVE";
+}
+
+static void print_status(uint32_t now) {
+    uint32_t whole;
+    uint32_t fraction;
+    bool positive;
+
+    char angle[16];
+    char temp[16];
+    char baseline[16];
+
+    float_split(angle_calibrated, 1, &positive, &whole, &fraction);
+    snprintf(angle, sizeof(angle), "%s%lu.%lu", positive ? "" : "-", whole, fraction);
+
+    float_split(temp_smoothed, 1, &positive, &whole, &fraction);
+    snprintf(temp, sizeof(temp), "%s%lu.%lu", positive ? "" : "-", whole, fraction);
+
+    if (temp_smoothed_baseline_ready) {
+        float_split(temp_smoothed_baseline, 1, &positive, &whole, &fraction);
+
+        snprintf(baseline, sizeof(baseline), "%s%lu.%lu", positive ? "" : "-", whole, fraction);
+    } else {
+        snprintf(baseline, sizeof(baseline), "--");
+    }
+
+    uint32_t turn_elapsed_s = 0;
+
+    if (device_mode == MONITOR) {
+        turn_elapsed_s = (now - last_reposition_ms) / 1000;
+    }
+
+    printf("\n--- STATUS ---\n");
+
+    printf("Mode: %s\n", device_mode == MONITOR ? "MONITOR" : "STANDBY");
+
+    printf("Presence: %s\n", ts1_is_touched ? "PRESENT" : "ABSENT");
+
+    printf("Angle: %s deg  Limit: %ld.%ld deg\n",
+           angle,
+           (long)(cfg_hob_limit_tenths / 10),
+           (long)(cfg_hob_limit_tenths % 10));
+
+    printf("Temp: %s C  Baseline: %s C  Delta limit: %ld.%ld C\n",
+           temp,
+           baseline,
+           (long)(cfg_delta_t_tenths / 10),
+           (long)(cfg_delta_t_tenths % 10));
+
+    printf("Turn: %02lu:%02lu  Interval: %ld s\n",
+           turn_elapsed_s / 60,
+           turn_elapsed_s % 60,
+           (long)cfg_turn_interval_s);
+
+    printf("Alerts: TURN=%s HOB=%s TEMP=%s\n",
+           alert_state(turn_due, &turn_due_alert),
+           alert_state(HOB_is_high, &hob_high_alert),
+           alert_state(temp_is_high, &temp_rise_alert));
+
+    printf("Session events: %lu\n", session_event_count);
+
+    printf("--------------\n");
+}
+
 static void console_handle_custom_command(uint32_t now, char* str) {
     if (strcmp(str, "CAL") == 0) {
         calibration_offset = angle_smoothed;
         angle_calibrated = 0;
 
         log_event(now, "Angle calibrated\n");
+    } else if (strcmp(str, "STATUS") == 0) {
+        print_status(now);
     }
 }
 
@@ -487,11 +729,31 @@ static void console_handle_line(uint32_t now) {
     if (ch == '\r') {
         cmd[cmd_len] = '\0';
         printf("\n");
-        // console_handle_line(now, cmd);
-        config_cmd_result_t result = config_table_command(cmd, NULL);
+
+        const config_entry_t* set_entry = NULL;
+
+        config_cmd_result_t result = config_table_command(cmd, &set_entry);
+
+        if (result == CFG_CMD_SET_OK) {
+            char value[16];
+            char message[64];
+
+            config_table_format(set_entry, value, sizeof(value));
+
+            snprintf(message,
+                     sizeof(message),
+                     "CONFIG %s %s %s\n",
+                     set_entry->name,
+                     value,
+                     set_entry->unit);
+
+            log_event(now, message);
+        }
+
         if (result == CFG_CMD_NOT_MINE) {
             console_handle_custom_command(now, cmd);
         }
+
         cmd_len = 0;
         cmd[0] = 0;
         return;
@@ -528,6 +790,8 @@ static void service_posture_change(uint32_t now) {
         last_reposition_ms = now;
         angle_at_last_reset = angle_calibrated;
         transition_started = false;
+
+        log_event(now, "POSTURE-CHANGE turn clock reset\n");
 
         if (turn_due) {
             turn_due = false;
@@ -608,13 +872,49 @@ static void service_temp_rise(uint32_t now, float temp_current) {
     // qualify_init(&qualify_temp_rise, cfg_delta_t_tenths, 0, 0, now);
     qualify_event_t event = qualify_feed(&temp_qualify, temp_delta, now);
     switch (event) {
-        case QUALIFY_SET:
+        // case QUALIFY_SET:
+        //     temp_is_high = true;
+
+        //     alert_start(&temp_rise_alert, now);
+
+        //     log_event(now, "TEMP-RISE\n");
+        //     break;
+        case QUALIFY_SET: {
             temp_is_high = true;
 
             alert_start(&temp_rise_alert, now);
 
-            log_event(now, "TEMP-RISE\n");
+            uint32_t current_whole;
+            uint32_t current_fraction;
+            bool current_positive;
+
+            uint32_t baseline_whole;
+            uint32_t baseline_fraction;
+            bool baseline_positive;
+
+            float_split(temp_current, 1, &current_positive, &current_whole, &current_fraction);
+
+            float_split(temp_smoothed_baseline,
+                        1,
+                        &baseline_positive,
+                        &baseline_whole,
+                        &baseline_fraction);
+
+            char message[96];
+
+            snprintf(message,
+                     sizeof(message),
+                     "TEMP-RISE trigger %s%lu.%lu C baseline %s%lu.%lu C\n",
+                     current_positive ? "" : "-",
+                     current_whole,
+                     current_fraction,
+                     baseline_positive ? "" : "-",
+                     baseline_whole,
+                     baseline_fraction);
+
+            log_event(now, message);
             break;
+        }
         case QUALIFY_CLEAR:
             temp_is_high = false;
             alert_clear(&temp_rise_alert);
@@ -709,6 +1009,7 @@ static void service_alert_acknowledge(uint32_t now) {
     alert_type_t alert_type = alert_highest_priority();
     alert_t* alert;
     char* name;
+
     switch (alert_type) {
         case ALERT_TURN_DUE:
             // alert_acknowledge(&turn_due_alert, now);
@@ -754,6 +1055,7 @@ static void service_alert_acknowledge(uint32_t now) {
 
 static void check_alert_rearm(alert_t* alert, bool condition, uint32_t now, char* log_message) {
     bool passed_alert_rearm_threshold = (now - alert->ack_ms) > (cfg_rearm_s * 1000);
+
     if (alert->acknowledged && condition && passed_alert_rearm_threshold) {
         alert->acknowledged = false;
         log_event(now, log_message);
@@ -770,7 +1072,6 @@ void app_service(void) {
     static uint32_t touch_last, status_last;
     static int32_t touch_raw = -1;
     uint32_t now = HAL_GetTick();
-    static bool ts1_is_touched = false;
     static ISM330DHCX_Axes_t imu_axes;
     static bool success = false;
 
@@ -794,10 +1095,26 @@ void app_service(void) {
         if (temp_handle_one_shot(&temp_raw)) {
             temp_one_shot_active = false;
             temp_smoothed = float_smooth(&temp_smoother, temp_raw);
-            if (!temp_smoothed_baseline_ready && temp_smoother.count == temp_smoother.sample_size) {
+            if (device_mode == MONITOR && !temp_smoothed_baseline_ready &&
+                temp_smoother.count == temp_smoother.sample_size) {
                 temp_smoothed_baseline_ready = true;
                 temp_smoothed_baseline = temp_smoothed;
-                log_event(now, "Temperature baseline ready\n");
+                // log_event(now, "Temperature baseline ready\n");
+                uint32_t whole;
+                uint32_t fraction;
+                bool positive;
+                char message[64];
+
+                float_split(temp_smoothed_baseline, 1, &positive, &whole, &fraction);
+
+                snprintf(message,
+                         sizeof(message),
+                         "Temperature baseline %s%lu.%lu C\n",
+                         positive ? "" : "-",
+                         whole,
+                         fraction);
+
+                log_event(now, message);
             }
         }
     }
@@ -856,6 +1173,22 @@ void app_service(void) {
         b1_pressed = false;
         service_alert_acknowledge(now);
     }
+
+    if (b2_pressed) {
+        b2_pressed = false;
+        ui_pages_next();
+    }
+
+    service_ui_banner();
+
+    static uint32_t ui_last = 0;
+
+    if ((now - ui_last) >= 500) {
+        ui_last = now;
+        ui_pages_mark_dirty();
+    }
+
+    ui_pages_service();
 
     // debug print every second
     static uint32_t prev_debug_print_ms = 0;
