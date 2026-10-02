@@ -141,6 +141,17 @@ static uint32_t mode_start_ms = 0;
 static uint32_t session_event_count = 0;
 static uint32_t session_alert_count = 0;
 
+typedef enum { POSTURE_SUPINE, POSTURE_LEFT_30, POSTURE_RIGHT_30, POSTURE_COUNT } posture_t;
+
+static float lateral_angle_samples[4] = { 0 };
+static smoother_t lateral_angle_smoother = { .samples = lateral_angle_samples, .sample_size = 4 };
+static float lateral_angle_smoothed = 0.0f;
+
+static posture_t last_posture = POSTURE_SUPINE;
+static posture_t current_posture = POSTURE_SUPINE;
+static uint32_t posture_time_ms[POSTURE_COUNT] = { 0 };
+static uint32_t posture_start_ms = 0;
+
 void float_split(float input, uint32_t decimal_places, bool* out_is_positive, uint32_t* out_whole,
                  uint32_t* out_fraction) {
     if (input < 0.0f) {
@@ -223,7 +234,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t pin) {
      * no OLED work here. */
     if (pin == User_B1_Pin) {
         b1_presses++;
-        print_debug_flag = true;
+        // print_debug_flag = true;
         b1_pressed = true;
     }
     if (pin == User_B2_Pin) {
@@ -326,8 +337,8 @@ static void render_live(void) {
     snprintf(value,
              sizeof(value),
              "%ld.%ld deg",
-             (long)(cfg_hob_limit_tenths / 10),
-             (long)(cfg_hob_limit_tenths % 10));
+             cfg_hob_limit_tenths / 10,
+             cfg_hob_limit_tenths % 10);
     ui_row_put(6, "HOB LIM", value);
 
     snprintf(value,
@@ -466,6 +477,40 @@ void app_init(void) {
     }
 }
 
+posture_t posture_classify(float lateral_angle) {
+    if (lateral_angle >= 20.0f && lateral_angle <= 40.0f) {
+        return POSTURE_RIGHT_30;
+    }
+
+    if (lateral_angle <= -20.0f && lateral_angle >= -40.0f) {
+        return POSTURE_LEFT_30;
+    }
+
+    return POSTURE_SUPINE;
+}
+
+static const char* posture_name(posture_t posture) {
+    switch (posture) {
+        case POSTURE_SUPINE:
+            return "SUPINE";
+
+        case POSTURE_LEFT_30:
+            return "LEFT-30";
+
+        case POSTURE_RIGHT_30:
+            return "RIGHT-30";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static void posture_time_reset() {
+    for (uint32_t i = 0; i < POSTURE_COUNT; i++) {
+        posture_time_ms[i] = 0;
+    }
+}
+
 static bool temp_handle_one_shot(float* out_temp) {
     uint8_t drdy_status = 0;
     int32_t status = STTS22H_TEMP_Get_DRDY_Status(&temp_sensor, &drdy_status);
@@ -555,6 +600,10 @@ static void service_device_mode(uint32_t now, bool ts1_is_touched) {
                 mode_start_ms = now;
                 session_event_count = 0;
                 session_alert_count = 0;
+                current_posture = posture_classify(lateral_angle_smoothed);
+                last_posture = current_posture;
+                posture_time_reset();
+                posture_start_ms = now;
                 qualify_init(&temp_qualify, cfg_delta_t_tenths, 0, 0, now);
                 log_event(now, "Device mode: Standby -> Monitor\n");
             }
@@ -681,19 +730,19 @@ static void print_status(uint32_t now) {
 
     printf("Angle: %s deg  Limit: %ld.%ld deg\n",
            angle,
-           (long)(cfg_hob_limit_tenths / 10),
-           (long)(cfg_hob_limit_tenths % 10));
+           cfg_hob_limit_tenths / 10,
+           cfg_hob_limit_tenths % 10);
 
     printf("Temp: %s C  Baseline: %s C  Delta limit: %ld.%ld C\n",
            temp,
            baseline,
-           (long)(cfg_delta_t_tenths / 10),
-           (long)(cfg_delta_t_tenths % 10));
+           cfg_delta_t_tenths / 10,
+           cfg_delta_t_tenths % 10);
 
     printf("Turn: %02lu:%02lu  Interval: %ld s\n",
            turn_elapsed_s / 60,
            turn_elapsed_s % 60,
-           (long)cfg_turn_interval_s);
+           cfg_turn_interval_s);
 
     printf("Alerts: TURN=%s HOB=%s TEMP=%s\n",
            alert_state(turn_due, &turn_due_alert),
@@ -701,6 +750,36 @@ static void print_status(uint32_t now) {
            alert_state(temp_is_high, &temp_rise_alert));
 
     printf("Session events: %lu\n", session_event_count);
+
+    uint32_t occupancy[POSTURE_COUNT];
+
+    for (uint32_t i = 0; i < POSTURE_COUNT; i++) {
+        occupancy[i] = posture_time_ms[i];
+    }
+
+    if (device_mode == MONITOR) {
+        occupancy[current_posture] += now - posture_start_ms;
+    }
+
+    uint32_t total_ms =
+        occupancy[POSTURE_SUPINE] + occupancy[POSTURE_LEFT_30] + occupancy[POSTURE_RIGHT_30];
+
+    uint32_t supine_pct = 0;
+    uint32_t left_pct = 0;
+    uint32_t right_pct = 0;
+
+    if (total_ms > 0) {
+        supine_pct = occupancy[POSTURE_SUPINE] * 100u / total_ms;
+        left_pct = occupancy[POSTURE_LEFT_30] * 100u / total_ms;
+        right_pct = occupancy[POSTURE_RIGHT_30] * 100u / total_ms;
+    }
+
+    printf("Posture: %s\n", posture_name(current_posture));
+
+    printf("Occupancy: SUPINE=%lu%% LEFT-30=%lu%% RIGHT-30=%lu%%\n",
+           supine_pct,
+           left_pct,
+           right_pct);
 
     printf("--------------\n");
 }
@@ -775,10 +854,17 @@ static void service_posture_change(uint32_t now) {
     float angle_delta = fabsf(angle_calibrated - angle_at_last_reset);
     float required_delta = cfg_delta_turn_tenths / 10.0f;
 
-    if (angle_delta < required_delta) {
+    posture_t new_posture = posture_classify(lateral_angle_smoothed);
+
+    if (new_posture == last_posture) {
         transition_started = false;
         return;
     }
+
+    // if (angle_delta < required_delta) {
+    //     transition_started = false;
+    //     return;
+    // }
 
     if (!transition_started) {
         transition_started = true;
@@ -791,7 +877,22 @@ static void service_posture_change(uint32_t now) {
         angle_at_last_reset = angle_calibrated;
         transition_started = false;
 
-        log_event(now, "POSTURE-CHANGE turn clock reset\n");
+        posture_time_ms[current_posture] += now - posture_start_ms;
+
+        current_posture = new_posture;
+        last_posture = current_posture;
+        posture_start_ms = now;
+
+        char message[64];
+
+        snprintf(message,
+                 sizeof(message),
+                 "POSTURE-CHANGE %s turn clock reset\n",
+                 posture_name(current_posture));
+
+        log_event(now, message);
+
+        // log_event(now, "POSTURE-CHANGE turn clock reset\n");
 
         if (turn_due) {
             turn_due = false;
@@ -1127,6 +1228,9 @@ void app_service(void) {
             // angle_smoothed = smooth_angle(angle_raw);
             angle_smoothed = float_smooth(&angle_smoother, angle_raw);
             angle_calibrated = angle_smoothed - calibration_offset;
+
+            float lateral_raw = atan2f(imu_axes.y, imu_axes.z) * 180.0f / 3.14159265f;
+            lateral_angle_smoothed = float_smooth(&lateral_angle_smoother, lateral_raw);
         }
         // if (!success)
     }
